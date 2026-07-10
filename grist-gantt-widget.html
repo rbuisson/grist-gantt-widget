@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grist Gantt Widget</title>
+  <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/frappe-gantt@1.0.3/dist/frappe-gantt.umd.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/frappe-gantt@1.0.3/dist/frappe-gantt.css" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f7f8;
+      --surface: #ffffff;
+      --text: #1f2328;
+      --muted: #667085;
+      --border: #d0d7de;
+      --accent: #0a7ea4;
+      --danger: #b42318;
+      --row-alt: #fbfbfc;
+      --shadow: 0 1px 2px rgba(16,24,40,.06);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --surface: #171b21;
+        --text: #e6edf3;
+        --muted: #9aa4b2;
+        --border: #30363d;
+        --accent: #4db6d6;
+        --danger: #f97066;
+        --row-alt: #12161b;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+    body { display: grid; grid-template-rows: auto 1fr; }
+    .toolbar {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      padding: 10px 12px; background: var(--surface); border-bottom: 1px solid var(--border); box-shadow: var(--shadow);
+    }
+    .toolbar .spacer { flex: 1 1 auto; }
+    .toolbar label { color: var(--muted); font-size: 12px; }
+    select, button, input[type="checkbox"] {
+      font: inherit;
+    }
+    select, button {
+      border: 1px solid var(--border); background: var(--surface); color: var(--text);
+      border-radius: 8px; padding: 7px 10px;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+    #status { padding: 6px 12px; color: var(--muted); font-size: 12px; }
+    #error { padding: 0 12px 10px; color: var(--danger); font-size: 13px; display: none; }
+    #wrap { overflow: auto; height: 100%; }
+    #gantt { min-width: 980px; padding: 8px 12px 18px; }
+    .empty {
+      margin: 24px 12px; padding: 16px; border: 1px dashed var(--border); border-radius: 12px;
+      background: var(--surface); color: var(--muted);
+    }
+    .legend { display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); }
+    .dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; background: var(--accent); }
+    .gantt-container { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); overflow: hidden; }
+    .gantt .grid-row:nth-child(even) rect { fill: var(--row-alt); }
+    .gantt .grid-header { fill: var(--surface); }
+    .gantt .grid-header text,
+    .gantt .lower-text,
+    .gantt .upper-text,
+    .gantt .row-label,
+    .gantt .bar-label { fill: var(--text) !important; }
+    .gantt .tick text { fill: var(--muted) !important; }
+    .gantt .today-highlight,
+    .gantt .today-highlight-0 { fill: rgba(10,126,164,.10); }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <label>View
+      <select id="viewMode">
+        <option>Day</option>
+        <option>Week</option>
+        <option selected>Month</option>
+        <option>Year</option>
+      </select>
+    </label>
+    <label><input id="showProgress" type="checkbox" checked> Show progress</label>
+    <label><input id="showDeps" type="checkbox" checked> Show dependencies</label>
+    <button id="savePrefs">Save view</button>
+    <button id="refreshBtn">Refresh</button>
+    <div class="spacer"></div>
+    <div class="legend"><span class="dot"></span><span>Click a bar to select the row in Grist. Drag/resize writes back dates.</span></div>
+  </div>
+  <div id="status">Loading…</div>
+  <div id="error"></div>
+  <div id="wrap">
+    <div id="gantt"></div>
+  </div>
+
+  <script>
+    const requestedColumns = [
+      { name: 'Title', type: 'Text', optional: false },
+      { name: 'Start', type: 'Date,DateTime', optional: false },
+      { name: 'End', type: 'Date,DateTime', optional: false },
+      { name: 'Progress', type: 'Numeric,Int', optional: true },
+      { name: 'Dependencies', type: 'Text', optional: true },
+      { name: 'Color', type: 'Text', optional: true }
+    ];
+
+    let state = {
+      mappings: null,
+      rows: [],
+      options: { viewMode: 'Month', showProgress: true, showDeps: true },
+      gantt: null,
+      tableId: null
+    };
+
+    const els = {
+      gantt: document.getElementById('gantt'),
+      status: document.getElementById('status'),
+      error: document.getElementById('error'),
+      viewMode: document.getElementById('viewMode'),
+      showProgress: document.getElementById('showProgress'),
+      showDeps: document.getElementById('showDeps')
+    };
+
+    function setStatus(msg) { els.status.textContent = msg; }
+    function setError(msg='') {
+      els.error.style.display = msg ? 'block' : 'none';
+      els.error.textContent = msg;
+    }
+
+    function parseDeps(raw) {
+      if (!raw) return '';
+      if (Array.isArray(raw)) return raw.map(String).join(',');
+      return String(raw).split(/[;,|]/).map(s => s.trim()).filter(Boolean).join(',');
+    }
+
+    function toISODateOnly(value) {
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    }
+
+    function mappedRows() {
+      return state.rows.map(r => grist.mapColumnNames(r, { mappings: state.mappings, columns: requestedColumns }));
+    }
+
+    function tasksFromRows() {
+      const tasks = [];
+      for (const r of mappedRows()) {
+        if (!r) continue;
+        const start = toISODateOnly(r.Start);
+        const end = toISODateOnly(r.End);
+        if (!r.Title || !start || !end) continue;
+        tasks.push({
+          id: String(r.id),
+          name: String(r.Title),
+          start,
+          end,
+          progress: Number.isFinite(Number(r.Progress)) ? Number(r.Progress) : 0,
+          dependencies: state.options.showDeps ? parseDeps(r.Dependencies) : '',
+          custom_class: r.Color ? '' : 'default-task',
+          _rowId: r.id,
+          _color: r.Color || ''
+        });
+      }
+      return tasks;
+    }
+
+    async function writeDatesBack(task) {
+      if (!state.tableId) return;
+      const start = toISODateOnly(task.start);
+      const end = toISODateOnly(task.end);
+      const mapped = state.mappings || {};
+      const startCol = mapped.Start;
+      const endCol = mapped.End;
+      if (!startCol || !endCol) return;
+      try {
+        await grist.docApi.applyUserActions([
+          ['UpdateRecord', state.tableId, Number(task.id), {
+            [startCol]: start,
+            [endCol]: end
+          }]
+        ]);
+        setStatus(`Updated row ${task.id}`);
+      } catch (e) {
+        setError(`Could not write dates back to Grist: ${e.message || e}`);
+      }
+    }
+
+    function tintBars(tasks) {
+      const bars = els.gantt.querySelectorAll('.bar-wrapper');
+      bars.forEach((bar, i) => {
+        const task = tasks[i];
+        if (!task || !task._color) return;
+        const rect = bar.querySelector('.bar');
+        const prog = bar.querySelector('.bar-progress');
+        if (rect) rect.style.fill = task._color;
+        if (prog) prog.style.fill = task._color;
+      });
+    }
+
+    function render() {
+      setError('');
+      const tasks = tasksFromRows();
+      els.gantt.innerHTML = '';
+      if (!tasks.length) {
+        els.gantt.innerHTML = '<div class="empty">No valid tasks to display. Map at least Title, Start, and End in the widget settings.</div>';
+        setStatus(`0 tasks`);
+        return;
+      }
+      const holder = document.createElement('div');
+      holder.className = 'gantt-container';
+      const svg = document.createElement('svg');
+      holder.appendChild(svg);
+      els.gantt.appendChild(holder);
+
+      state.gantt = new Gantt(svg, tasks, {
+        view_mode: state.options.viewMode,
+        language: 'en',
+        readonly: false,
+        show_expected_progress: false,
+        popup: ({ task }) => `
+          <div style="padding:10px 12px; min-width:220px;">
+            <strong>${escapeHtml(task.name)}</strong><br>
+            <div style="margin-top:6px; color:#667085;">${task.start} → ${task.end}</div>
+            <div style="margin-top:4px; color:#667085;">Progress: ${task.progress || 0}%</div>
+            <div style="margin-top:4px; color:#667085;">Row ID: ${task.id}</div>
+          </div>` ,
+        on_click: async (task) => {
+          try {
+            await grist.setCursorPos({ rowId: Number(task.id) });
+            setStatus(`Selected row ${task.id}`);
+          } catch (e) {
+            setError(`Could not select row in Grist: ${e.message || e}`);
+          }
+        },
+        on_date_change: async (task) => {
+          await writeDatesBack(task);
+        },
+        on_progress_change: async (task, progress) => {
+          const progressCol = state.mappings && state.mappings.Progress;
+          if (!progressCol || !state.tableId || !state.options.showProgress) return;
+          try {
+            await grist.docApi.applyUserActions([
+              ['UpdateRecord', state.tableId, Number(task.id), { [progressCol]: Math.round(progress) }]
+            ]);
+            setStatus(`Updated progress on row ${task.id}`);
+          } catch (e) {
+            setError(`Could not write progress back: ${e.message || e}`);
+          }
+        }
+      });
+
+      tintBars(tasks);
+      setStatus(`${tasks.length} task(s)`);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+    }
+
+    async function savePrefs() {
+      state.options.viewMode = els.viewMode.value;
+      state.options.showProgress = els.showProgress.checked;
+      state.options.showDeps = els.showDeps.checked;
+      await grist.setOption('viewMode', state.options.viewMode);
+      await grist.setOption('showProgress', state.options.showProgress);
+      await grist.setOption('showDeps', state.options.showDeps);
+      render();
+      setStatus('Preferences saved');
+    }
+
+    document.getElementById('savePrefs').addEventListener('click', savePrefs);
+    document.getElementById('refreshBtn').addEventListener('click', render);
+    els.viewMode.addEventListener('change', () => { state.options.viewMode = els.viewMode.value; render(); });
+    els.showProgress.addEventListener('change', () => { state.options.showProgress = els.showProgress.checked; render(); });
+    els.showDeps.addEventListener('change', () => { state.options.showDeps = els.showDeps.checked; render(); });
+
+    grist.ready({ requiredAccess: 'full', columns: requestedColumns, allowSelectBy: true });
+
+    grist.onOptions((opts) => {
+      state.options = { ...state.options, ...(opts || {}) };
+      els.viewMode.value = state.options.viewMode || 'Month';
+      els.showProgress.checked = !!state.options.showProgress;
+      els.showDeps.checked = !!state.options.showDeps;
+    });
+
+    grist.onRecords(async (rows, mappings) => {
+      state.rows = rows || [];
+      state.mappings = mappings || {};
+      try {
+        state.tableId = await grist.selectedTable.getTableId();
+      } catch (e) {
+        state.tableId = null;
+      }
+      render();
+    });
+  </script>
+</body>
+</html>
